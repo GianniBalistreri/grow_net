@@ -5,10 +5,11 @@ Neural network architectures
 """
 
 import numpy as np
+import math
 import torch
 import torch.nn as nn
 
-from typing import List
+from typing import List, Union
 
 
 INITIALIZER: dict = dict(#constant=torch.nn.init.constant_,
@@ -82,14 +83,14 @@ def set_initializer(x, **kwargs):
         INITIALIZER.get(kwargs.get('initializer'))(x)
 
 
-class EnsembleException(Exception):
+class EnsembleNetworkException(Exception):
     """
-    Class for handling exceptions for class Ensemble
+    Class for handling exceptions for class EnsembleNetwork
     """
     pass
 
 
-class Ensemble:
+class EnsembleNetwork:
     """
     Class for building and training an ensemble of neural networks (MLP)
     """
@@ -104,7 +105,11 @@ class Ensemble:
         self.models: List[torch.nn.Module] = []
         self.c0 = c0
         self.learning_rate: float = learning_rate
-        self.boost_rate: nn.Parameter = nn.Parameter(torch.tensor(self.learning_rate, requires_grad=True, device="cuda"))
+        self.boost_rate: nn.Parameter = nn.Parameter(torch.tensor(self.learning_rate,
+                                                                  requires_grad=True,
+                                                                  device="cuda" if torch.cuda.is_available() else 'cpu'
+                                                                  )
+                                                     )
 
     def add(self, model: torch.nn.Module):
         """
@@ -147,18 +152,31 @@ class Ensemble:
         for m in self.models:
             m.train(True)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor, update_gradient: bool):
         if len(self.models) == 0:
             return None, self.c0
         middle_feat_cum = None
         prediction = None
-        with torch.no_grad():
+        if update_gradient:
             for m in self.models:
                 if middle_feat_cum is None:
-                    middle_feat_cum, prediction = m(x, middle_feat_cum)
+                    middle_feat_cum_tmp, prediction = m(x, middle_feat_cum)
+                    middle_feat_cum = middle_feat_cum_tmp.clone()
                 else:
-                    middle_feat_cum, pred = m(x, middle_feat_cum)
-                    prediction += pred
+                    middle_feat_cum_new, pred = m(x, middle_feat_cum)
+                    middle_feat_cum = middle_feat_cum + middle_feat_cum_new
+                    if prediction is None:
+                        prediction = pred
+                    else:
+                        prediction = prediction + pred
+        else:
+            with torch.no_grad():
+                for m in self.models:
+                    if middle_feat_cum is None:
+                        middle_feat_cum, prediction = m(x, middle_feat_cum)
+                    else:
+                        middle_feat_cum, pred = m(x, middle_feat_cum)
+                        prediction += pred
         return middle_feat_cum, self.c0 + self.boost_rate * prediction
 
     def forward_grad(self, x):
@@ -169,10 +187,15 @@ class Ensemble:
         prediction = None
         for m in self.models:
             if middle_feat_cum is None:
-                middle_feat_cum, prediction = m(x, middle_feat_cum)
+                middle_feat_cum_tmp, prediction = m(x, middle_feat_cum)
+                middle_feat_cum = middle_feat_cum_tmp.clone()
             else:
-                middle_feat_cum, pred = m(x, middle_feat_cum)
-                prediction += pred
+                middle_feat_cum_new, pred = m(x, middle_feat_cum)
+                middle_feat_cum = middle_feat_cum + middle_feat_cum_new
+                if prediction is None:
+                    prediction = pred
+                else:
+                    prediction = prediction + pred
         return middle_feat_cum, self.c0 + self.boost_rate * prediction
 
 
@@ -187,11 +210,14 @@ class MLP(torch.nn.Module):
     """
     Class for applying Multi Layer Perceptron (Fully Connected Layer) using PyTorch as a Deep Learning Framework
     """
-    def __init__(self, parameters: dict, input_size: int, output_size: int
+    def __init__(self,
+                 parameters: dict,
+                 input_size: int,
+                 output_size: int
                  ):
         """
         :param parameters: dict
-			Parameter settings
+            Parameter settings
 
         :param input_size: int
             Number of input features
@@ -204,10 +230,11 @@ class MLP(torch.nn.Module):
         """
         super(MLP, self).__init__()
         self.params: dict = parameters
-        self.hidden_layers: List[torch.torch.nn.Linear] = []
+        self.input_size: int = input_size
+        self.hidden_layers: Union[List[nn.Linear], List[SparseLinear]] = []
         self.dropout_layers: List[nn.functional] = []
-        self.use_alpha_dropout: bool = False
         self.activation_functions: List[nn.functional] = []
+        self.normalization: Union[List[nn.BatchNorm1d], List[nn.LayerNorm]] = []
         self.batch_size: int = self.params.get('batch_size')
         self.output_size: int = output_size
         if output_size == 1:
@@ -216,65 +243,129 @@ class MLP(torch.nn.Module):
             self.activation_output: nn.functional = nn.functional.sigmoid
         else:
             self.activation_output: nn.functional = nn.functional.softmax
-        if self.params is None:
-            self.fully_connected_layer: torch.nn = torch.torch.nn.Linear(in_features=input_size,
-                                                                         out_features=output_size,
+        if self.params.get('initializer') is None:
+            self.params.update(dict(initializer=np.random.choice(a=list(INITIALIZER.keys()))))
+        #set_initializer(x=x, **self.params)
+        _l: int = 1
+        if self.params.get('num_hidden_layers') > 1:
+            for layer in range(1, self.params.get('num_hidden_layers') + 1, 1):
+                if layer == self.params.get('num_hidden_layers'):
+                    break
+                self.dropout_layers.append(self.params[f'hidden_layer_{layer}_dropout_rate'])
+                self.activation_functions.append(self.params[f'hidden_layer_{layer}_activation'])
+                if self.params.get('normalization') == 'batch':
+                    self.normalization.append(nn.BatchNorm1d(num_features=self.params.get(f'hidden_layer_{layer + 1}_neurons'),
+                                                             eps=1e-5,
+                                                             momentum=0.1,
+                                                             affine=True,
+                                                             track_running_stats=True
+                                                             )
+                                              )
+                else:
+                    self.normalization.append(nn.LayerNorm(normalized_shape=self.params.get(f'hidden_layer_{layer + 1}_neurons'),
+                                                           eps=1e-5,
+                                                           elementwise_affine=True
+                                                           ))
+                self.hidden_layers.append(torch.nn.Linear(in_features=self.params[f'hidden_layer_{layer}_neurons'],
+                                                          out_features=self.params[f'hidden_layer_{layer + 1}_neurons'],
+                                                          bias=True
+                                                          )
+                                          )
+                _l += 1
+        if self.params.get('use_sparse'):
+            self.fully_connected_input_layer: torch.nn = SparseLinear(input_features=input_size,
+                                                                      output_features=self.params['hidden_layer_1_neurons'],
+                                                                      bias=True
+                                                                      )
+        else:
+            self.fully_connected_input_layer: torch.nn = torch.nn.Linear(in_features=input_size,
+                                                                         out_features=self.params['hidden_layer_1_neurons'],
                                                                          bias=True
                                                                          )
-        else:
-            _l: int = 0
-            for layer in range(0, len(self.params.keys()), 1):
-                if self.params.get('hidden_layer_{}_neurons'.format(layer)) is not None:
-                    if self.params['hidden_layer_{}_alpha_dropout'.format(layer)]:
-                        self.use_alpha_dropout = True
-                    self.dropout_layers.append(self.params['hidden_layer_{}_dropout'.format(layer)])
-                    self.activation_functions.append(self.params['hidden_layer_{}_activation'.format(layer)])
-                    if len(self.hidden_layers) == 0:
-                        self.hidden_layers.append(torch.torch.nn.Linear(in_features=input_size,
-                                                                        out_features=self.params['hidden_layer_{}_neurons'.format(layer)],
-                                                                        bias=True
-                                                                        )
-                                                  )
-                    else:
-                        if layer + 1 < len(self.params.keys()):
-                            _l += 1
-                            self.hidden_layers.append(torch.torch.nn.Linear(in_features=self.params['hidden_layer_{}_neurons'.format(layer - 1)],
-                                                                            out_features=self.params['hidden_layer_{}_neurons'.format(layer)],
-                                                                            bias=True
-                                                                            )
-                                                      )
-                        else:
-                            _l = layer
-                #else:
-                #    break
-            if len(self.hidden_layers) == 0:
-                self.fully_connected_layer: torch.nn = torch.torch.nn.Linear(in_features=input_size,
-                                                                             out_features=output_size,
-                                                                             bias=True
-                                                                             )
-            else:
-                self.fully_connected_layer: torch.nn = torch.torch.nn.Linear(in_features=self.params['hidden_layer_{}_neurons'.format(_l)],
-                                                                             out_features=output_size,
-                                                                             bias=True
-                                                                             )
+        self.fully_connected_output_layer: torch.nn = torch.nn.Linear(in_features=self.params[f'hidden_layer_{_l}_neurons'],
+                                                                      #out_features=output_size,
+                                                                      out_features=1,
+                                                                      bias=True
+                                                                      )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor, penultimate_feature: torch.Tensor) -> tuple:
         """
         Feed forward algorithm
 
-        :param x:
+        :param x: torch.Tensor
             Input
+
+        :param penultimate_feature: torch.Tensor
+            Penultimate feature (middle feature) from previous network
 
         :return: Configured neural network
         """
-        if self.params.get('initializer') is None:
-            self.params.update(dict(initializer=np.random.choice(a=list(INITIALIZER.keys()))))
-        set_initializer(x=x, **self.params)
         x = x.float()
+        if penultimate_feature is not None:
+            x = torch.cat([x, penultimate_feature], dim=1)
+            if self.params.get('normalization') == 'batch':
+                x = nn.BatchNorm1d(num_features=self.input_size,
+                                   eps=1e-5,
+                                   momentum=0.1,
+                                   affine=True,
+                                   track_running_stats=True
+                                   )(x)
+            else:
+                x = nn.LayerNorm(normalized_shape=self.input_size,
+                                 eps=1e-5,
+                                 elementwise_affine=True
+                                 )(x)
+        x = nn.functional.leaky_relu(self.fully_connected_input_layer(x))
         for l, layer in enumerate(self.hidden_layers):
             x = self.activation_functions[l](layer(x))
-            if self.use_alpha_dropout:
+            x = self.normalization[l](x)
+            if self.params.get('use_alpha_dropout'):
                 x = nn.functional.alpha_dropout(input=x, p=self.dropout_layers[l], training=True, inplace=False)
             else:
                 x = nn.functional.dropout(input=x, p=self.dropout_layers[l], training=True, inplace=False)
-        return self.activation_output(self.fully_connected_layer(x))
+        return x, self.fully_connected_output_layer(self.activation_output(x))
+
+
+class SparseLinear(nn.Module):
+    """
+    Class for applying sparse linear layer
+    """
+    def __init__(self, input_features: int, output_features: int, bias: bool = True):
+        super(SparseLinear, self).__init__()
+        self.input_features: int = input_features
+        self.output_features: int = output_features
+        self.weight: nn.Parameter = nn.Parameter(torch.Tensor(output_features, input_features))
+        if bias:
+            self.bias: nn.Parameter = nn.Parameter(torch.Tensor(output_features))
+        else:
+            self.register_parameter('bias', None)
+        _standard_deviation: float = 1. / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-_standard_deviation, _standard_deviation)
+
+    def forward(self, x):
+        return sparse_linear(x, self.weight, self.bias)
+
+
+class SparseLinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias=None):
+        ctx.save_for_backward(input, weight, bias)
+        output = input.mm(weight.t())
+        if bias is not None:
+            output += bias.unsqueeze(0).expand_as(output)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weight, bias = ctx.saved_tensors
+        grad_input = grad_weight = grad_bias = None
+        if ctx.needs_input_grad[0]:
+            grad_input = grad_output.mm(weight)
+        if ctx.needs_input_grad[1]:
+            grad_weight = (input.t().mm(grad_output)).t()
+        if bias is not None and ctx.needs_input_grad[2]:
+            grad_bias = grad_output.sum(0).squeeze(0)
+        return grad_input, grad_weight, grad_bias
+
+
+sparse_linear = SparseLinearFunction.apply
